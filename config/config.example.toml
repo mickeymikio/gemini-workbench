@@ -1,0 +1,9 @@
+# ~/.config/wb/config.toml
+# Non-secret configuration for Gemini Web Workbench (/home/spark)
+
+# Public Read-Only workbench repository synced via `python3 ~/wb/bin/wb sync`
+workbench_repo = "mickeymikio/gemini-workbench"
+workbench_branch = "main"
+
+# Automatic garbage collection retention days for ~/runs/*
+runs_retention_days = 7

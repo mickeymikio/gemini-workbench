@@ -1,0 +1,25 @@
+# Secrets and private keys (NEVER commit)
+tokens.conf
+secrets.env
+*.env
+!*.example.env
+id_ed25519*
+*.pem
+*.key
+
+# Python / uv / runtime artifacts
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Scratch test outputs
+tmp/
+runs/

@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""wb — Zero-Token Unified Workbench CLI for Gemini Web Persistent VM (/home/spark).
+
+Designed to comply strictly with Gemini Web Cloud VM policies:
+- Pure Python 3 stdlib (no sudo/uname/df shell reconnaissance, no .bashrc edits, no PAT storage).
+- Syncs tools Read-Only over public HTTPS (`GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt`).
+- Subcommands: status | sync | new | export | gc
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import time
+import zipfile
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # pragma: no cover
+    tomllib = None  # type: ignore
+
+WB_HOME = Path(os.environ.get("WB_HOME", str(Path.home())))
+SHARE_DIR = WB_HOME / ".local" / "share"
+CFG_DIR = WB_HOME / ".config" / "wb"
+CFG_FILE = CFG_DIR / "config.toml"
+WB_DIR = Path(os.environ.get("WB_DIR", str(WB_HOME / "wb")))
+WB_VENV = SHARE_DIR / "wb-venv"
+BROWSERS_DIR = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", str(SHARE_DIR / "ms-playwright")))
+DATA_DIR = WB_HOME / "data"
+DATASETS_DIR = DATA_DIR / "datasets"
+RUNS_DIR = WB_HOME / "runs"
+SYS_CA = Path("/etc/ssl/certs/ca-certificates.crt")
+
+
+def git_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if SYS_CA.is_file():
+        env.setdefault("GIT_SSL_CAINFO", str(SYS_CA))
+        env.setdefault("SSL_CERT_FILE", str(SYS_CA))
+    return env
+
+
+def load_config() -> dict:
+    if not CFG_FILE.is_file():
+        return {}
+    raw = CFG_FILE.read_bytes()
+    if tomllib is not None:
+        return tomllib.loads(raw.decode("utf-8"))
+    cfg: dict[str, object] = {}
+    for line in raw.decode("utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        k, v = [p.strip() for p in line.split("=", 1)]
+        if v.startswith(('"', "'")) and v.endswith(('"', "'")):
+            cfg[k] = v[1:-1]
+        elif v.isdigit():
+            cfg[k] = int(v)
+        else:
+            cfg[k] = v
+    return cfg
+
+
+def slugify(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", text.strip().lower()).strip("-")
+    return cleaned or "task"
+
+
+def human_bytes(num: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(num) < 1024.0:
+            return f"{num:.1f}{unit}"
+        num /= 1024.0
+    return f"{num:.1f}PiB"
+
+
+def cmd_gc(days: int | None = None, quiet: bool = False) -> None:
+    cfg = load_config()
+    retention_days = days if days is not None else int(cfg.get("runs_retention_days", 7))
+    cutoff = time.time() - (retention_days * 86400)
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
+    deleted = 0
+    for child in RUNS_DIR.iterdir():
+        if child.is_dir() and child.stat().st_mtime < cutoff:
+            shutil.rmtree(child, ignore_errors=True)
+            deleted += 1
+
+    if not quiet:
+        print(f"[wb gc] Pruned {deleted} run director(ies) older than {retention_days} days.")
+
+
+def cmd_status() -> None:
+    cmd_gc(quiet=True)
+    cfg = load_config()
+    usage = shutil.disk_usage(WB_HOME)
+    venv_py = WB_VENV / "bin" / "python"
+    venv_status = "NOT INSTALLED"
+    if venv_py.is_file():
+        out = subprocess.run([str(venv_py), "--version"], capture_output=True, text=True)
+        venv_status = (out.stdout or out.stderr).strip()
+
+    chromium_dirs = list(BROWSERS_DIR.glob("chromium*")) if BROWSERS_DIR.is_dir() else []
+    browser_status = f"ready ({len(chromium_dirs)} bundle(s) in $HOME)" if chromium_dirs else "NOT INSTALLED"
+
+    rev = "untracked"
+    if (WB_DIR / ".git").is_dir():
+        res = subprocess.run(
+            ["git", "-C", str(WB_DIR), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            rev = res.stdout.strip()
+
+    print("=== Gemini Workbench Status ===")
+    print(f"Manifest : {WB_DIR / 'AGENTS.md'} ({'present' if (WB_DIR / 'AGENTS.md').is_file() else 'MISSING'}, rev={rev})")
+    print(f"Repo     : {cfg.get('workbench_repo', 'mickeymikio/gemini-workbench')} (Zero-Token Public HTTPS)")
+    print(f"DiskFree : {human_bytes(usage.free)} free / {human_bytes(usage.total)} total")
+    print(f"BaseVenv : {venv_status}")
+    print(f"Chromium : {browser_status}")
+    print(f"--- Datasets ({DATASETS_DIR}) ---")
+    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+    topics = [d for d in sorted(DATASETS_DIR.iterdir()) if d.is_dir() and not d.name.startswith(".")]
+    if not topics:
+        print("  (no datasets accumulated yet)")
+    else:
+        for d in topics:
+            files = [f for f in d.rglob("*") if f.is_file() and not f.name.startswith(".")]
+            size = sum(f.stat().st_size for f in files)
+            print(f"  - {d.name}: {len(files)} file(s), {human_bytes(size)}")
+    print("===============================")
+
+
+def cmd_sync() -> None:
+    cfg = load_config()
+    wb_repo = str(cfg.get("workbench_repo", "mickeymikio/gemini-workbench"))
+    branch = str(cfg.get("workbench_branch", "main"))
+    remote_url = f"https://github.com/{wb_repo}.git"
+    env = git_env()
+
+    if not (WB_DIR / ".git").is_dir():
+        print(f"[wb sync] Cloning {remote_url} into {WB_DIR}...")
+        tmp_dir = WB_HOME / ".wb-sync-tmp"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        subprocess.run(["git", "clone", "--branch", branch, remote_url, str(tmp_dir)], env=env, check=True)
+        if WB_DIR.exists():
+            shutil.rmtree(WB_DIR)
+        shutil.move(str(tmp_dir), str(WB_DIR))
+    else:
+        print(f"[wb sync] Pulling latest {branch} from {remote_url}...")
+        subprocess.run(["git", "-C", str(WB_DIR), "remote", "set-url", "origin", remote_url], env=env, check=True)
+        subprocess.run(["git", "-C", str(WB_DIR), "fetch", "origin", branch], env=env, check=True)
+        subprocess.run(["git", "-C", str(WB_DIR), "reset", "--hard", f"origin/{branch}"], env=env, check=True)
+
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    example_cfg = WB_DIR / "config" / "config.example.toml"
+    if example_cfg.is_file() and not CFG_FILE.is_file():
+        shutil.copy2(example_cfg, CFG_FILE)
+
+    rev = subprocess.check_output(["git", "-C", str(WB_DIR), "rev-parse", "--short", "HEAD"], text=True).strip()
+    print(f"[wb sync] Up to date: {rev}")
+
+
+def cmd_new(raw_slug: str) -> None:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = RUNS_DIR / f"{ts}-{slugify(raw_slug)}"
+    for sub in ("scripts", "downloads", "out"):
+        (run_dir / sub).mkdir(parents=True, exist_ok=True)
+    print(run_dir)
+
+
+def cmd_export(target_str: str, dest_dir_str: str | None, name: str | None) -> None:
+    """Copy a file or zip a directory into the active chat working directory for instant download."""
+    target = Path(target_str).expanduser().resolve()
+    if not target.exists():
+        raise SystemExit(f"[wb:error] Path does not exist: {target}")
+
+    dest_dir = Path(dest_dir_str).expanduser().resolve() if dest_dir_str else Path.cwd()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d-%H%M")
+    if target.is_file():
+        out_name = name or target.name
+        out_path = dest_dir / out_name
+        if out_path.resolve() != target:
+            shutil.copy2(target, out_path)
+    else:
+        base_slug = slugify(name or target.name)
+        out_path = dest_dir / f"{ts}-{base_slug}.zip"
+        with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+            for item in sorted(target.rglob("*")):
+                if item.is_file() and not item.name.startswith("."):
+                    zf.write(item, arcname=str(item.relative_to(target)))
+
+    print(f"[wb export] Ready in working directory: {out_path} ({human_bytes(out_path.stat().st_size)})")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="wb", description="Gemini Web Zero-Token Workbench CLI")
+    sub = parser.add_subparsers(dest="subcmd", required=True)
+
+    sub.add_parser("status", help="Check VM health, GC old runs, and list accumulated Parquet datasets")
+    sub.add_parser("sync", help="Pull latest tools & AGENTS.md from public GitHub over HTTPS (zero token)")
+
+    p_new = sub.add_parser("new", help="Create an isolated per-task directory under ~/runs/")
+    p_new.add_argument("slug", nargs="?", default="task")
+
+    p_exp = sub.add_parser("export", help="Export file or zip directory into current chat /working_dir for download")
+    p_exp.add_argument("path", help="File or directory to export")
+    p_exp.add_argument("--dest", default=None, help="Destination directory (defaults to current working dir)")
+    p_exp.add_argument("--name", default=None, help="Optional output filename or archive slug")
+
+    p_gc = sub.add_parser("gc", help="Prune old ~/runs/ directories")
+    p_gc.add_argument("--days", type=int, default=None)
+    p_gc.add_argument("--quiet", "-q", action="store_true")
+
+    args = parser.parse_args()
+    if args.subcmd == "status":
+        cmd_status()
+    elif args.subcmd == "sync":
+        cmd_sync()
+    elif args.subcmd == "new":
+        cmd_new(args.slug)
+    elif args.subcmd == "export":
+        cmd_export(args.path, args.dest, args.name)
+    elif args.subcmd == "gc":
+        cmd_gc(args.days, args.quiet)
+
+
+if __name__ == "__main__":
+    main()
