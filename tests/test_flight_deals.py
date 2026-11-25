@@ -10,6 +10,7 @@ import unittest
 from pydantic import ValidationError
 
 from tasks.flight_deals.config import ROUTES_15, ROUTE_BY_CODE, is_lcc_airline
+from tasks.flight_deals.dashboard import build_dashboard_html, load_snapshots
 from tasks.flight_deals.models import JST, FetchFailure, FlightObservation, format_date_ja
 from tasks.flight_deals.reporter import render_report
 from tasks.flight_deals.run import append_checkpoint, load_intrarun_checkpoint
@@ -345,6 +346,32 @@ class TestCheckpointAndReporter(unittest.TestCase):
         self.assertIn(format_date_ja("2027-02-10"), md)
         self.assertIn("■ 参考観測（40%未満でも、各路線の最安は1件ずつ）", md)
         self.assertIn("■ 取得できなかったもの", md)
+
+        with tempfile.TemporaryDirectory() as td:
+            snap_dir = Path(td) / "snapshots"
+            snap_dir.mkdir()
+            snap_payload = {
+                "run_date_jst": "2026-11-25",
+                "executed_at_jst": "2026-11-25 19:30:52 JST",
+                "confirmed_route_count": 2,
+                "total_routes": 15,
+                "deal_count": 2,
+                "observations": [
+                    {**d1.model_dump(), "discount_pct": d1.discount_pct, "is_deal_40_off": d1.is_deal_40_off},
+                    {**d2.model_dump(), "discount_pct": d2.discount_pct, "is_deal_40_off": d2.is_deal_40_off},
+                ],
+                "failures": [fail.model_dump()],
+            }
+            import json
+
+            (snap_dir / "2026-11-25.json").write_text(json.dumps(snap_payload), encoding="utf-8")
+            loaded = load_snapshots(snap_dir)
+            self.assertEqual(len(loaded), 1)
+            art_html = build_dashboard_html(loaded, mode="artifact")
+            self.assertIn("https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js", art_html)
+            self.assertNotIn(":root", art_html)
+            st_html = build_dashboard_html(loaded, mode="standalone")
+            self.assertIn(":root", st_html)
 
 
 if __name__ == "__main__":

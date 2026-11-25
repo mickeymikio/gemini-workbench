@@ -310,7 +310,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--out",
         default=None,
-        help="Optional output Markdown report path (also printed to stdout if --print-report is set).",
+        help="Optional output Markdown report path.",
+    )
+    parser.add_argument(
+        "--json-out",
+        default=None,
+        help="Optional structured JSON snapshot output path for dashboard ingestion.",
     )
     parser.add_argument(
         "--concurrency",
@@ -361,7 +366,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
 
-    report_md = render_report(observations, failures, routes=selected_routes)
+    now_jst = datetime.now(JST)
+    report_md = render_report(observations, failures, routes=selected_routes, executed_at=now_jst)
 
     if args.out:
         out_path = Path(args.out).expanduser().resolve()
@@ -370,6 +376,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"[flight_deals] Report written to: {out_path}", flush=True)
     else:
         print("\n" + report_md, flush=True)
+
+    if args.json_out:
+        json_path = Path(args.json_out).expanduser().resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        confirmed_routes = len({o.route_code for o in observations})
+        obs_dicts = [
+            {
+                **o.model_dump(),
+                "discount_pct": o.discount_pct,
+                "is_deal_40_off": o.is_deal_40_off,
+            }
+            for o in observations
+        ]
+        snapshot = {
+            "run_date_jst": today.isoformat(),
+            "executed_at_jst": now_jst.strftime("%Y-%m-%d %H:%M:%S JST"),
+            "confirmed_route_count": confirmed_routes,
+            "total_routes": len(selected_routes),
+            "deal_count": sum(1 for o in observations if o.is_deal_40_off),
+            "observations": obs_dicts,
+            "failures": [f.model_dump() for f in failures],
+        }
+        json_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[flight_deals] JSON snapshot written to: {json_path}", flush=True)
 
     if args.save_parquet:
         pq = save_observations_parquet(observations, today)
