@@ -41,14 +41,24 @@ def parse_typical_range_jpy(text: str) -> tuple[float, float] | None:
 
 def parse_checked_baggage_ja(booking_text: str) -> str:
     """Parse checked baggage inclusion lines from Google Flights' fare summary screen."""
-    has_paid = bool(
-        re.search(r"受託手荷物は\s*1\s*個目から有料|受託手荷物\s*[:：]?\s*別料金|受託手荷物なし", booking_text)
+    fee_match = re.search(
+        r"1\s*個目の受託手荷物\s*[:：]\s*([￥¥]?\s*[\d,]+\s*(?:円)?(?:\s*[～〜~\-－]\s*[￥¥]?\s*[\d,]+\s*(?:円)?)?)",
+        booking_text,
     )
+    has_paid = bool(
+        re.search(
+            r"受託手荷物は\s*1\s*個目から有料|受託手荷物\s*[:：]?\s*別料金|受託手荷物なし",
+            booking_text,
+        )
+    ) or (fee_match is not None)
     free_match = re.search(r"受託手荷物は\s*(\d+)\s*個まで無料|受託手荷物\s*(\d+)\s*個無料", booking_text)
     unknown_info = "手荷物料金の情報が提供されません" in booking_text
 
     if has_paid and free_match:
         return "受託手荷物：片道のみ無料・片道は有料（往復混在）"
+    if fee_match:
+        fee_str = re.sub(r"\s+", "", fee_match.group(1))
+        return f"受託手荷物：含まれず（1個目 {fee_str} 別料金）"
     if has_paid:
         return "受託手荷物：含まれず（1個目から別料金）"
     if free_match:
@@ -404,7 +414,12 @@ async def verify_google_flights_dates(
                         sel_ret = r_card.get_by_role("button", name="フライトを選択")
                         if await sel_ret.count() > 0:
                             await sel_ret.first.click(timeout=3000)
-                            await page.wait_for_timeout(3500)
+                            try:
+                                await page.locator("text=/受託手荷物|手荷物料金/").first.wait_for(
+                                    state="visible", timeout=6500
+                                )
+                            except Exception:
+                                await page.wait_for_timeout(4200)
                             booking_text = await page.locator("body").inner_text()
                             checked_baggage = parse_checked_baggage_ja(booking_text)
                             if typical_range is None:

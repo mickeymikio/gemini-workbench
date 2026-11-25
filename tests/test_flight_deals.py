@@ -170,6 +170,10 @@ class TestGoogleFlightsAndKayakParsers(unittest.TestCase):
             "受託手荷物：含まれず（1個目から別料金）",
         )
         self.assertEqual(
+            parse_checked_baggage_ja("1 個目の受託手荷物: ￥2,655～8,360"),
+            "受託手荷物：含まれず（1個目 ￥2,655～8,360 別料金）",
+        )
+        self.assertEqual(
             parse_checked_baggage_ja("受託手荷物は 2 個まで無料"),
             "受託手荷物：含まれる（2個まで無料）",
         )
