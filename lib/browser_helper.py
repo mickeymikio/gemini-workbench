@@ -107,6 +107,8 @@ def sync_open_page(
     viewport: dict[str, int] | None = None,
     timeout_ms: int = 45_000,
     ignore_https_errors: bool = True,
+    locale: str | None = None,
+    timezone_id: str | None = None,
 ) -> Iterator["Page"]:  # type: ignore[name-defined]
     """Open an isolated headless Chromium page with container-safe & TLS-proxy-safe flags."""
     from playwright.sync_api import sync_playwright  # type: ignore
@@ -115,18 +117,24 @@ def sync_open_page(
     if dl_path:
         Path(dl_path).mkdir(parents=True, exist_ok=True)
 
+    ctx_kwargs: dict[str, object] = {
+        "accept_downloads": True,
+        "ignore_https_errors": ignore_https_errors,
+        "user_agent": user_agent,
+        "viewport": viewport or {"width": 1440, "height": 900},
+    }
+    if locale:
+        ctx_kwargs["locale"] = locale
+    if timezone_id:
+        ctx_kwargs["timezone_id"] = timezone_id
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
             args=LAUNCH_ARGS,
             downloads_path=dl_path,
         )
-        context = browser.new_context(
-            accept_downloads=True,
-            ignore_https_errors=ignore_https_errors,
-            user_agent=user_agent,
-            viewport=viewport or {"width": 1440, "height": 900},
-        )
+        context = browser.new_context(**ctx_kwargs)  # type: ignore[arg-type]
         context.set_default_timeout(timeout_ms)
         page = context.new_page()
         try:
@@ -143,8 +151,48 @@ async def async_open_page(
     viewport: dict[str, int] | None = None,
     timeout_ms: int = 45_000,
     ignore_https_errors: bool = True,
+    locale: str | None = None,
+    timezone_id: str | None = None,
 ) -> AsyncIterator["AsyncPage"]:  # type: ignore[name-defined]
     """Async counterpart of sync_open_page."""
+    from playwright.async_api import async_playwright  # type: ignore
+
+    dl_path = str(Path(download_dir).expanduser().resolve()) if download_dir else None
+    if dl_path:
+        Path(dl_path).mkdir(parents=True, exist_ok=True)
+
+    ctx_kwargs: dict[str, object] = {
+        "accept_downloads": True,
+        "ignore_https_errors": ignore_https_errors,
+        "user_agent": user_agent,
+        "viewport": viewport or {"width": 1440, "height": 900},
+    }
+    if locale:
+        ctx_kwargs["locale"] = locale
+    if timezone_id:
+        ctx_kwargs["timezone_id"] = timezone_id
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=LAUNCH_ARGS,
+            downloads_path=dl_path,
+        )
+        context = await browser.new_context(**ctx_kwargs)  # type: ignore[arg-type]
+        context.set_default_timeout(timeout_ms)
+        page = await context.new_page()
+        try:
+            yield page
+        finally:
+            await context.close()
+            await browser.close()
+
+
+@asynccontextmanager
+async def async_open_browser(
+    download_dir: str | Path | None = None,
+) -> AsyncIterator["AsyncBrowser"]:  # type: ignore[name-defined]
+    """Launch a single shared headless Chromium instance for creating multiple isolated contexts."""
     from playwright.async_api import async_playwright  # type: ignore
 
     dl_path = str(Path(download_dir).expanduser().resolve()) if download_dir else None
@@ -157,18 +205,9 @@ async def async_open_page(
             args=LAUNCH_ARGS,
             downloads_path=dl_path,
         )
-        context = await browser.new_context(
-            accept_downloads=True,
-            ignore_https_errors=ignore_https_errors,
-            user_agent=user_agent,
-            viewport=viewport or {"width": 1440, "height": 900},
-        )
-        context.set_default_timeout(timeout_ms)
-        page = await context.new_page()
         try:
-            yield page
+            yield browser
         finally:
-            await context.close()
             await browser.close()
 
 

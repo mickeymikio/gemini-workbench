@@ -66,6 +66,17 @@
 
 ---
 
-## 5. サンドボックス安全規約
+## 5. 定型タスクスイート（`tasks/`）
+
+- **国際線15路線ディール実画面確認タスク（`tasks/flight_deals/run.py`）**：
+  ```bash
+  RUN_DIR="$(python3 ~/wb/bin/wb new flight-deals)"
+  ~/.local/share/wb-venv/bin/python ~/wb/tasks/flight_deals/run.py --run-dir "$RUN_DIR" --out "$RUN_DIR/out/report.md" --save-parquet
+  python3 ~/wb/bin/wb export "$RUN_DIR/out/report.md" --name "flight-deals-report.md"
+  ```
+
+---
+
+## 6. サンドボックス安全規約
 
 - `~/.bashrc` や `~/.profile` の書き換え、`sudo` / `uname` / `df` 等のシステム偵察コマンドの実行、およびVM内ファイルへの認証トークン保存は行わないでください。
