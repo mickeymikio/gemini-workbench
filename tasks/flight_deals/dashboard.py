@@ -140,7 +140,7 @@ def build_dashboard_html(snapshots: Sequence[dict[str, Any]], mode: str = "artif
     <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-4 border-b border-[var(--border)]">
       <div>
         <div class="flex items-center gap-2">
-          <span class="px-2 py-0.5 text-xs font-semibold rounded bg-[var(--secondary)] text-[var(--primary)] border border-[var(--border)]">Gemini Cloud VM (/home/spark) 実画面検証</span>
+          <span class="px-2 py-0.5 text-xs font-semibold rounded bg-[var(--secondary)] text-[var(--primary)] border border-[var(--border)]">自動実画面検証（15路線・7サイト）</span>
           <span class="text-xs text-[var(--muted-foreground)]">毎日 13:00 JST 自動更新</span>
         </div>
         <h1 class="text-xl md:text-2xl font-bold mt-1">成田（NRT）・羽田（HND）国際線15路線 往復最安値＆ディール監視</h1>
