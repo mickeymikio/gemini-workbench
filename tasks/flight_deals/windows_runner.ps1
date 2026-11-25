@@ -1,12 +1,13 @@
 # Standalone runner & installer for Windows 10/11 Pro (e.g. NAS Windows VM)
 # Runs 100% locally with Python + Playwright (zero Gemini Web access).
 #
-# Full one-shot setup (venv + daily 13:00 Task Scheduler + background LAN server on :8787 + first run):
-#   powershell -ExecutionPolicy Bypass -File .\tasks\flight_deals\windows_runner.ps1 -InstallAll -RunNow
+# Full one-shot setup (venv + daily 13:00 Task Scheduler + background LAN/Tailscale server on :8787):
+#   powershell -ExecutionPolicy Bypass -File .\tasks\flight_deals\windows_runner.ps1 -InstallAll
 
 param(
     [switch]$InstallAll,
     [switch]$RegisterSchedule,
+    [switch]$RestartServerOnly,
     [switch]$RunNow,
     [string]$DailyTime = "13:00",
     [int]$DashboardPort = 8787,
@@ -46,29 +47,90 @@ function Ensure-Venv {
     }
 }
 
-function Ensure-DashboardServer {
-    $Listening = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue
-    if (-not $Listening) {
-        $RunnerPy = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
-        $ServeScript = Join-Path $RepoDir "tasks\flight_deals\serve_dashboard.py"
-        Start-Process -FilePath $RunnerPy -ArgumentList "`"$ServeScript`" --dir `"$DashDir`" --port $DashboardPort" -WindowStyle Hidden
-        Start-Sleep -Seconds 1
+function Ensure-FirewallRule {
+    $RuleName = "FlightDealsDashboard_LAN_$DashboardPort"
+    try {
+        # Remove older Private-only rule if present; NAS virtual NICs & Tailscale adapters often default
+        # to Windows 'Public' (Unidentified network) profile, so scope safely via RemoteAddress instead!
+        Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName $RuleName `
+            -Direction Inbound `
+            -Profile Any `
+            -RemoteAddress @("LocalSubnet", "100.64.0.0/10", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12") `
+            -Protocol TCP `
+            -LocalPort $DashboardPort `
+            -Action Allow `
+            -ErrorAction Stop | Out-Null
+        Write-Host "[windows_runner] Configured Windows Firewall TCP port $DashboardPort (LAN + Tailscale 100.64.0.0/10)."
+    } catch {
+        Write-Host "[windows_runner] Note: Run once in Administrator PowerShell to open Firewall for LAN & Tailscale:"
+        Write-Host "  New-NetFirewallRule -DisplayName '$RuleName' -Direction Inbound -Profile Any -RemoteAddress LocalSubnet,100.64.0.0/10,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12 -Protocol TCP -LocalPort $DashboardPort -Action Allow"
     }
 }
 
-function Get-LanIPv4 {
-    $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and $_.PrefixOrigin -ne "WellKnown" } |
-        Select-Object -First 1 -ExpandProperty IPAddress)
-    if ($ip) { return $ip }
-    return "127.0.0.1"
+function Register-DashboardServerTask {
+    $RunnerPy = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
+    $ServeScript = Join-Path $RepoDir "tasks\flight_deals\serve_dashboard.py"
+    $SrvAction = New-ScheduledTaskAction -Execute $RunnerPy -Argument "`"$ServeScript`" --dir `"$DashDir`" --port $DashboardPort"
+    $SrvTrigger = New-ScheduledTaskTrigger -AtLogOn
+    $SrvSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName "FlightDealsDashboardServer" -Action $SrvAction -Trigger $SrvTrigger -Settings $SrvSettings -Force | Out-Null
+}
+
+function Ensure-DashboardServer {
+    $Listening = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue
+    if (-not $Listening) {
+        # Start via Task Scheduler first so the server survives outside ephemeral agent/SSH shells!
+        if (Get-ScheduledTask -TaskName "FlightDealsDashboardServer" -ErrorAction SilentlyContinue) {
+            Start-ScheduledTask -TaskName "FlightDealsDashboardServer" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+        $Listening = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue
+        if (-not $Listening) {
+            $RunnerPy = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
+            $ServeScript = Join-Path $RepoDir "tasks\flight_deals\serve_dashboard.py"
+            Start-Process -FilePath $RunnerPy -ArgumentList "`"$ServeScript`" --dir `"$DashDir`" --port $DashboardPort" -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+        }
+    }
+    $FinalCheck = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue
+    if ($FinalCheck) {
+        Write-Host "[windows_runner] Dashboard HTTP server is LISTENING on 0.0.0.0:$DashboardPort"
+    } else {
+        Write-Warning "[windows_runner] Dashboard HTTP server failed to bind port $DashboardPort"
+    }
+}
+
+function Print-AccessUrls {
+    $AllIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
+        Select-Object -ExpandProperty IPAddress
+    foreach ($ip in $AllIps) {
+        if ($ip -like "100.*") {
+            Write-Host "  -> Tailscale URL (works across NAT): http://${ip}:${DashboardPort}/"
+        } else {
+            Write-Host "  -> Adapter IP URL                 : http://${ip}:${DashboardPort}/"
+        }
+    }
+}
+
+if ($RestartServerOnly) {
+    Ensure-Venv
+    Register-DashboardServerTask
+    Ensure-FirewallRule
+    Ensure-DashboardServer
+    Print-AccessUrls
+    exit 0
 }
 
 if ($InstallAll -or $RegisterSchedule) {
     Ensure-Venv
     $ScriptPath = $MyInvocation.MyCommand.Path
 
-    # 1. Daily 13:00 Flight Deals Verification Task
     $DailyAction = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`" -DashboardPort $DashboardPort -Concurrency $Concurrency"
     $DailyTrigger = New-ScheduledTaskTrigger -Daily -At $DailyTime
@@ -76,33 +138,14 @@ if ($InstallAll -or $RegisterSchedule) {
         -StartWhenAvailable `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
-        -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 45)
     Register-ScheduledTask -TaskName "DailyFlightDeals15Routes" -Action $DailyAction -Trigger $DailyTrigger -Settings $TaskSettings -Force | Out-Null
 
-    # 2. Background LAN Dashboard HTTP Server Task (AtLogOn + immediate start)
-    $RunnerPy = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
-    $ServeScript = Join-Path $RepoDir "tasks\flight_deals\serve_dashboard.py"
-    $SrvAction = New-ScheduledTaskAction -Execute $RunnerPy -Argument "`"$ServeScript`" --dir `"$DashDir`" --port $DashboardPort"
-    $SrvTrigger = New-ScheduledTaskTrigger -AtLogOn
-    $SrvSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-    Register-ScheduledTask -TaskName "FlightDealsDashboardServer" -Action $SrvAction -Trigger $SrvTrigger -Settings $SrvSettings -Force | Out-Null
-
-    # 3. Private-LAN Firewall rule (succeeds if elevated; otherwise prints helper command)
-    try {
-        if (-not (Get-NetFirewallRule -DisplayName "FlightDealsDashboard_LAN_$DashboardPort" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName "FlightDealsDashboard_LAN_$DashboardPort" `
-                -Direction Inbound -Profile Private -Protocol TCP -LocalPort $DashboardPort -Action Allow -ErrorAction Stop | Out-Null
-            Write-Host "[windows_runner] Opened Windows Firewall TCP port $DashboardPort (Private LAN only)."
-        }
-    } catch {
-        Write-Host "[windows_runner] Note: To access from other LAN devices (Mac/iPhone), run once in Administrator PowerShell:"
-        Write-Host "  New-NetFirewallRule -DisplayName 'FlightDealsDashboard_LAN_$DashboardPort' -Direction Inbound -Profile Private -Protocol TCP -LocalPort $DashboardPort -Action Allow"
-    }
-
+    Register-DashboardServerTask
+    Ensure-FirewallRule
     Ensure-DashboardServer
-    $LanIp = Get-LanIPv4
-    Write-Host "[windows_runner] Registered 'DailyFlightDeals15Routes' (Daily at $DailyTime) & 'FlightDealsDashboardServer' (Port $DashboardPort)."
-    Write-Host "[windows_runner] LAN Dashboard URL: http://${LanIp}:${DashboardPort}/"
+    Write-Host "[windows_runner] Registered 'DailyFlightDeals15Routes' (Daily at $DailyTime) & 'FlightDealsDashboardServer'."
+    Print-AccessUrls
 
     if (-not $RunNow) {
         exit 0
@@ -111,12 +154,10 @@ if ($InstallAll -or $RegisterSchedule) {
 
 Ensure-Venv
 
-# Prune temporary run directories older than 7 days
 Get-ChildItem -Path (Join-Path $WbHome "runs") -Directory -ErrorAction SilentlyContinue |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-# Pull latest parser updates from public repo quietly (non-fatal if offline)
 try {
     git -C $RepoDir pull --ff-only origin main 2>$null | Out-Null
 } catch {}
@@ -145,6 +186,5 @@ Copy-Item -Force $ReportPath $LatestReport
     --mode standalone
 
 Ensure-DashboardServer
-$LanIp = Get-LanIPv4
 Write-Host "[windows_runner] Completed! Report: $LatestReport"
-Write-Host "[windows_runner] Dashboard live at: http://${LanIp}:${DashboardPort}/"
+Print-AccessUrls
