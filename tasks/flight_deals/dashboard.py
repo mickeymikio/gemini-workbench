@@ -554,6 +554,10 @@ def build_dashboard_html(snapshots: Sequence[dict[str, Any]], mode: str = "artif
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    import sys
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     parser = argparse.ArgumentParser(description="Build interactive HTML dashboard from JSON snapshots.")
     parser.add_argument(
         "--ingest-bundle-b64",
