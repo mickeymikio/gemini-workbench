@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from datetime import date, datetime
 import json
 import os
 from pathlib import Path
 import sys
 from typing import Sequence
+import zlib
 
 WB_ROOT = Path(__file__).resolve().parents[2]
 if str(WB_ROOT) not in sys.path:
@@ -318,6 +320,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Optional structured JSON snapshot output path for dashboard ingestion.",
     )
     parser.add_argument(
+        "--bundle-b64-out",
+        default=None,
+        help="Optional zlib+base64 bundle path containing both report_md and snapshot JSON (~4KB).",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=3,
@@ -377,9 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print("\n" + report_md, flush=True)
 
-    if args.json_out:
-        json_path = Path(args.json_out).expanduser().resolve()
-        json_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.json_out or args.bundle_b64_out:
         confirmed_routes = len({o.route_code for o in observations})
         obs_dicts = [
             {
@@ -398,8 +403,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "observations": obs_dicts,
             "failures": [f.model_dump() for f in failures],
         }
-        json_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[flight_deals] JSON snapshot written to: {json_path}", flush=True)
+        if args.json_out:
+            json_path = Path(args.json_out).expanduser().resolve()
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[flight_deals] JSON snapshot written to: {json_path}", flush=True)
+        if args.bundle_b64_out:
+            b64_path = Path(args.bundle_b64_out).expanduser().resolve()
+            b64_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_bundle = json.dumps(
+                {"report_md": report_md, "snapshot": snapshot},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            encoded = base64.b64encode(zlib.compress(raw_bundle, level=9)).decode("ascii")
+            b64_path.write_text(encoded, encoding="utf-8")
+            print(
+                f"[flight_deals] Compact bundle written to: {b64_path} ({len(encoded)} chars)",
+                flush=True,
+            )
 
     if args.save_parquet:
         pq = save_observations_parquet(observations, today)

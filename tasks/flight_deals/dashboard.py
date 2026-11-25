@@ -10,9 +10,12 @@ Supports two output modes from the same daily JSON snapshots (`snapshots/*.json`
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 from pathlib import Path
+import re
 from typing import Any, Sequence
+import zlib
 
 ALL_15_META: list[dict[str, Any]] = [
     {"code": "NRT-ICN", "origin": "NRT", "dest": "ICN", "city_ja": "ソウル仁川", "region": "asia"},
@@ -36,15 +39,39 @@ ALL_15_META: list[dict[str, Any]] = [
 def load_snapshots(snapshots_dir: Path) -> list[dict[str, Any]]:
     if not snapshots_dir.is_dir():
         return []
-    by_date: dict[str, dict[str, Any]] = {}
+    by_key: dict[str, dict[str, Any]] = {}
     for fp in sorted(snapshots_dir.glob("*.json")):
         try:
             data = json.loads(fp.read_text(encoding="utf-8"))
         except Exception:
             continue
         if isinstance(data, dict) and "run_date_jst" in data and "observations" in data:
-            by_date[str(data["run_date_jst"])] = data
-    return [by_date[k] for k in sorted(by_date.keys(), reverse=True)]
+            key = str(data.get("executed_at_jst") or data["run_date_jst"])
+            by_key[key] = data
+    return [by_key[k] for k in sorted(by_key.keys(), reverse=True)]
+
+
+def ingest_bundle_b64(bundle_text: str, dashboard_dir: Path) -> tuple[Path, Path, str]:
+    """Decode a `bundle.b64` payload (with or without markers) and persist snapshot + report."""
+    m = re.search(r"BUNDLE_B64_START=*\s*([A-Za-z0-9+/=\s]+?)\s*=*BUNDLE_B64_END", bundle_text)
+    b64_clean = re.sub(r"\s+", "", m.group(1) if m else bundle_text)
+    raw_bytes = zlib.decompress(base64.b64decode(b64_clean))
+    bundle = json.loads(raw_bytes.decode("utf-8"))
+    report_md = str(bundle["report_md"])
+    snapshot = dict(bundle["snapshot"])
+
+    run_date = str(snapshot["run_date_jst"])
+    snap_dir = dashboard_dir / "snapshots"
+    rep_dir = dashboard_dir / "reports"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    rep_dir.mkdir(parents=True, exist_ok=True)
+
+    snap_file = snap_dir / f"{run_date}.json"
+    rep_file = rep_dir / f"{run_date}.md"
+    snap_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    rep_file.write_text(report_md, encoding="utf-8")
+    (rep_dir / "latest.md").write_text(report_md, encoding="utf-8")
+    return (snap_file, rep_file, report_md)
 
 
 def build_dashboard_html(snapshots: Sequence[dict[str, Any]], mode: str = "artifact") -> str:
@@ -529,8 +556,18 @@ def build_dashboard_html(snapshots: Sequence[dict[str, Any]], mode: str = "artif
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build interactive HTML dashboard from JSON snapshots.")
     parser.add_argument(
+        "--ingest-bundle-b64",
+        default=None,
+        help="Optional path to a file containing raw or marker-wrapped bundle.b64 to ingest first.",
+    )
+    parser.add_argument(
+        "--dashboard-dir",
+        default=None,
+        help="Base dashboard directory (used with --ingest-bundle-b64; contains snapshots/ and reports/).",
+    )
+    parser.add_argument(
         "--snapshots-dir",
-        required=True,
+        default=None,
         help="Directory containing daily YYYY-MM-DD.json snapshot files.",
     )
     parser.add_argument(
@@ -539,19 +576,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Output HTML file path.",
     )
     parser.add_argument(
+        "--artifact-out",
+        default=None,
+        help="Optional secondary output path rendered in Antigravity 'artifact' mode.",
+    )
+    parser.add_argument(
         "--mode",
         choices=("standalone", "artifact"),
         default="standalone",
-        help="Output theming mode (default: standalone).",
+        help="Output theming mode for --out (default: standalone).",
     )
     args = parser.parse_args(argv)
 
-    snaps = load_snapshots(Path(args.snapshots_dir).expanduser().resolve())
+    dash_dir = Path(args.dashboard_dir).expanduser().resolve() if args.dashboard_dir else None
+    if args.ingest_bundle_b64:
+        if dash_dir is None:
+            dash_dir = Path(args.out).expanduser().resolve().parent
+        b64_txt = Path(args.ingest_bundle_b64).expanduser().resolve().read_text(encoding="utf-8")
+        snap_f, rep_f, _ = ingest_bundle_b64(b64_txt, dash_dir)
+        print(f"[dashboard] Ingested bundle -> {snap_f} & {rep_f}")
+
+    snap_dir = (
+        Path(args.snapshots_dir).expanduser().resolve()
+        if args.snapshots_dir
+        else (dash_dir / "snapshots" if dash_dir else Path(args.out).expanduser().resolve().parent / "snapshots")
+    )
+    snaps = load_snapshots(snap_dir)
     html_str = build_dashboard_html(snaps, mode=args.mode)
     out_path = Path(args.out).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_str, encoding="utf-8")
     print(f"[dashboard] Wrote {args.mode} dashboard ({len(snaps)} snapshot(s)) -> {out_path}")
+
+    if args.artifact_out:
+        art_path = Path(args.artifact_out).expanduser().resolve()
+        art_path.parent.mkdir(parents=True, exist_ok=True)
+        art_path.write_text(build_dashboard_html(snaps, mode="artifact"), encoding="utf-8")
+        print(f"[dashboard] Wrote artifact dashboard ({len(snaps)} snapshot(s)) -> {art_path}")
     return 0
 
 
