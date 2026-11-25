@@ -72,7 +72,7 @@ def build_secondary_search_url(
     if site_name == "Cheapflights":
         return f"https://www.cheapflights.com/flight-search/{o}-{d}/{dep_date}/{ret_date}?sort=price_a"
     if site_name == "momondo":
-        return f"https://www.momondo.jp/flight-search/{o}-{d}/{dep_date}/{ret_date}?sort=price_a"
+        return f"https://www.momondo.com/flight-search/{o}-{d}/{dep_date}/{ret_date}?sort=price_a"
     if site_name == "Priceline":
         d1 = dep_date.replace("-", "")
         d2 = ret_date.replace("-", "")
@@ -123,6 +123,18 @@ def _extract_airline_from_nrc6(card: KayakCardDict, origin: str, dest: str) -> s
     return " ／ ".join(found_carriers) if found_carriers else "航空会社名（画面カード参照）"
 
 
+def _detect_card_currency_and_price(price_text: str) -> tuple[str, float] | None:
+    m_jpy = _YEN_PRICE_RE.search(price_text)
+    if m_jpy:
+        val = float(m_jpy.group(1).replace(",", ""))
+        return ("JPY", val) if val >= 8000.0 else None
+    m_usd = _USD_PRICE_RE.search(price_text)
+    if m_usd:
+        val = float(m_usd.group(1).replace(",", ""))
+        return ("USD", val) if val >= 80.0 else None
+    return None
+
+
 def _parse_kayak_family_screen(
     site_name: str,
     route: RouteSpec,
@@ -133,32 +145,6 @@ def _parse_kayak_family_screen(
     full_body_text: str,
 ) -> FlightObservation | FetchFailure:
     """Parse `.nrc6` result cards on KAYAK / Cheapflights / momondo."""
-    expect_jpy = site_name in ("KAYAK", "momondo")
-    currency = "JPY" if expect_jpy else "USD"
-    price_re = _YEN_PRICE_RE if expect_jpy else _USD_PRICE_RE
-
-    # Extract same-site typical price ONLY if explicitly displayed on this site's screen
-    typ_low: float | None = None
-    typ_high: float | None = None
-    typ_pat = _KAYAK_TYPICAL_JA_RE if expect_jpy else _KAYAK_TYPICAL_EN_RE
-    m_typ = typ_pat.search(full_body_text)
-    if m_typ:
-        v1 = float(m_typ.group(1).replace(",", ""))
-        v2 = float(m_typ.group(2).replace(",", "")) if m_typ.group(2) else v1
-        if 0 < v1 <= v2:
-            typ_low, typ_high = v1, v2
-
-    tax_status = "税込"
-    if "税別" in full_body_text or "excludes taxes" in full_body_text.lower():
-        tax_status = "税別"
-    elif (
-        "税込" not in full_body_text
-        and "税金" not in full_body_text
-        and "taxes and fees" not in full_body_text.lower()
-        and expect_jpy is False
-    ):
-        tax_status = "税込表記確認不可"
-
     rivals = set(_COTERMINAL_RIVALS.get(route.origin.upper(), ())) | set(
         _COTERMINAL_RIVALS.get(route.dest.upper(), ())
     )
@@ -167,23 +153,39 @@ def _parse_kayak_family_screen(
 
     for card in cards:
         raw = card["raw_text"]
-        # Must include both requested IATA codes (KAYAK renders e.g. 'NRT成田国際空港' or 'HND')
         if not re.search(rf"\b{re.escape(route.origin.upper())}", raw):
             continue
         if not re.search(rf"\b{re.escape(route.dest.upper())}", raw):
             continue
-        # Reject co-terminal substitutions (e.g. NRT leg inside an HND search or DMK inside BKK)
         if any(re.search(rf"\b{re.escape(rv)}", raw) for rv in rivals):
             continue
 
-        # Parse dedicated `.f8F1-price-text` / `[class*="price-text"]` first to avoid upsell/baggage badges!
-        m_main_price = price_re.search(card["price_text"])
-        if not m_main_price:
+        detected = _detect_card_currency_and_price(card["price_text"])
+        if detected is None:
             continue
-        card_price = float(m_main_price.group(1).replace(",", ""))
-        min_reasonable = 8000.0 if currency == "JPY" else 80.0
-        if card_price < min_reasonable:
-            continue
+        currency, card_price = detected
+
+        # Extract same-site typical price ONLY if explicitly displayed in matching currency on this screen
+        typ_low: float | None = None
+        typ_high: float | None = None
+        typ_pat = _KAYAK_TYPICAL_JA_RE if currency == "JPY" else _KAYAK_TYPICAL_EN_RE
+        m_typ = typ_pat.search(full_body_text)
+        if m_typ:
+            v1 = float(m_typ.group(1).replace(",", ""))
+            v2 = float(m_typ.group(2).replace(",", "")) if m_typ.group(2) else v1
+            if 0 < v1 <= v2:
+                typ_low, typ_high = v1, v2
+
+        tax_status = "税込"
+        if "税別" in full_body_text or "excludes taxes" in full_body_text.lower():
+            tax_status = "税別"
+        elif (
+            "税込" not in full_body_text
+            and "税金" not in full_body_text
+            and "taxes and fees" not in full_body_text.lower()
+            and currency != "JPY"
+        ):
+            tax_status = "税込表記確認不可"
 
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         stops_text = "経由あり"

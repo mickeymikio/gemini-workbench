@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import platform
 import sys
 from typing import AsyncIterator, Iterator
 
@@ -49,19 +50,35 @@ def configure_browser_env() -> None:
 
 configure_browser_env()
 
-LAUNCH_ARGS: list[str] = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--no-first-run",
-    "--no-zygote",
-]
+def _build_launch_args() -> list[str]:
+    if platform.system() == "Linux":
+        return [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-zygote",
+        ]
+    return ["--no-first-run"]
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
+
+def _build_default_user_agent() -> str:
+    sys_name = platform.system()
+    if sys_name == "Windows":
+        os_token = "Windows NT 10.0; Win64; x64"
+    elif sys_name == "Darwin":
+        os_token = "Macintosh; Intel Mac OS X 10_15_7"
+    else:
+        os_token = "X11; Linux x86_64"
+    return (
+        f"Mozilla/5.0 ({os_token}) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+
+LAUNCH_ARGS: list[str] = _build_launch_args()
+DEFAULT_USER_AGENT: str = _build_default_user_agent()
 
 
 @dataclass

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timedelta
+import random
 import re
 
 from ..config import MAX_DAYS_AHEAD, MIN_DAYS_AHEAD, RouteSpec, is_lcc_airline
@@ -210,6 +211,8 @@ async def discover_cheapest_dates_6m(
         # seed +14 -> [+7..+66], seed +74 -> [+67..+126], seed +134 -> [+127..+186]
         seed_offsets = (14, 74, 134)
         for idx, offset in enumerate(seed_offsets):
+            if idx > 0:
+                await asyncio.sleep(random.uniform(1.0, 1.8))
             seed_dep = today_jst + timedelta(days=offset)
             if seed_dep > max_dep:
                 continue

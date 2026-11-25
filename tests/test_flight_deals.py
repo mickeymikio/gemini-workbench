@@ -20,7 +20,7 @@ from tasks.flight_deals.sites.google_flights import (
     parse_flight_card_fields,
     parse_typical_range_jpy,
 )
-from tasks.flight_deals.sites.other_sites import _parse_kayak_family_screen
+from tasks.flight_deals.sites.other_sites import _parse_kayak_family_screen, build_secondary_search_url
 from tasks.flight_deals.tfs import build_google_flights_url, encode_roundtrip_tfs
 
 
@@ -236,6 +236,28 @@ class TestGoogleFlightsAndKayakParsers(unittest.TestCase):
         self.assertIsNone(res.typical_price)
         self.assertIsNone(res.discount_pct)
         self.assertTrue(res.is_lcc)
+
+        momondo_url = build_secondary_search_url("momondo", "NRT", "ICN", "2027-02-10", "2027-02-14")
+        self.assertTrue(momondo_url.startswith("https://www.momondo.com/flight-search/NRT-ICN/"))
+        momondo_card = {
+            "price_text": "$220",
+            "carrier_text": "",
+            "raw_text": "Compare flights once the results have fully loaded.\n9:55 am – 12:35 pm\nZIPAIR\nnonstop\nNRT\n-\nICN\n$220\nEconomy Cabin\nSelect",
+        }
+        res_mm = _parse_kayak_family_screen(
+            "momondo",
+            route,
+            "2027-02-10",
+            "2027-02-14",
+            momondo_url,
+            [momondo_card],
+            momondo_card["raw_text"],
+        )
+        self.assertIsInstance(res_mm, FlightObservation)
+        assert isinstance(res_mm, FlightObservation)
+        self.assertEqual(res_mm.currency, "USD")
+        self.assertEqual(res_mm.lowest_price, 220.0)
+        self.assertEqual(res_mm.airline, "ZIPAIR")
 
         # Must reject co-terminal substitution (NRT leg inside an HND-LAX search)
         bad_coterm = {

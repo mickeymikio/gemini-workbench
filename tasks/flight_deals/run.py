@@ -16,6 +16,7 @@ from datetime import date, datetime
 import json
 import os
 from pathlib import Path
+import random
 import sys
 from typing import Sequence
 import zlib
@@ -111,16 +112,17 @@ async def execute_run(
     } | {(f.source_site, f.route_code) for f in failures}
 
     async with async_open_browser() as browser:
-        # Phase A: Google Flights (6-month discovery + verified search screen) with bounded concurrency
+        # Phase A: Google Flights — run strictly 1 route at a time with human-paced jitter
+        # to prevent triggering burst rate-limiting (/sorry/) across 15 routes.
         if "Google Flights" in sites:
-            sem = asyncio.Semaphore(max(1, concurrency))
+            gf_sem = asyncio.Semaphore(1)
 
             async def _gf_worker(idx: int, r: RouteSpec) -> None:
                 if ("Google Flights", r.code) in done_pairs and r.code in route_best_dates:
                     return
-                async with sem:
+                async with gf_sem:
                     if idx > 0:
-                        await asyncio.sleep(0.8 * (idx % concurrency))
+                        await asyncio.sleep(random.uniform(2.2, 3.8))
                     ctx = await browser.new_context(
                         ignore_https_errors=True,
                         user_agent=DEFAULT_USER_AGENT,
@@ -168,10 +170,13 @@ async def execute_run(
                     finally:
                         await ctx.close()
 
-            await asyncio.gather(*(_gf_worker(i, r) for i, r in enumerate(routes)))
+            for i, r in enumerate(routes):
+                await _gf_worker(i, r)
 
-        # Phase B: Secondary sites (run per-site with 2-strike circuit breaker for blocked/timed-out domains)
+        # Phase B: Secondary sites (serialize KAYAK/Cheapflights/momondo so sister R9 CDN domains
+        # are never hammered concurrently; 2-strike circuit breaker on blocked/errored domains)
         active_secondary = [s for s in SECONDARY_SITES if s in sites]
+        r9_family_lock = asyncio.Semaphore(1)
 
         async def _site_lane(site_name: str) -> None:
             consecutive_blocks = 0
@@ -184,12 +189,11 @@ async def execute_run(
                 viewport={"width": 1440, "height": 950},
             )
             try:
-                for r in routes:
+                for idx, r in enumerate(routes):
                     if (site_name, r.code) in done_pairs:
                         continue
 
                     if site_name == "catchfrog.ai":
-                        # Probe catchfrog.ai once on the first route, then apply the verified site-wide structural reason
                         if consecutive_blocks >= 1:
                             fl = FetchFailure(
                                 source_site=site_name,
@@ -210,7 +214,7 @@ async def execute_run(
                             route_code=r.code,
                             category="circuit_breaker_skipped",
                             reason_ja=(
-                                f"先行{CIRCUIT_BREAKER_CONSECUTIVE_BLOCKS}路線で連続ブロック／タイムアウト"
+                                f"先行{CIRCUIT_BREAKER_CONSECUTIVE_BLOCKS}路線で連続ブロック／エラー"
                                 f"（{block_reason_memo}）を確認したため同一ドメイン残路線をスキップ"
                             ),
                         )
@@ -225,8 +229,19 @@ async def execute_run(
                         date.fromordinal(today.toordinal() + 60).isoformat(),
                         date.fromordinal(today.toordinal() + 60 + r.stay_nights[1]).isoformat(),
                     )
-                    print(f"[{site_name}] Checking {r.code} ({dep_s}..{ret_s})...", flush=True)
-                    res = await check_route_secondary_site(ctx, site_name, r, dep_s, ret_s)
+
+                    if site_name in ("KAYAK", "Cheapflights", "momondo"):
+                        async with r9_family_lock:
+                            if idx > 0:
+                                await asyncio.sleep(random.uniform(1.4, 2.5))
+                            print(f"[{site_name}] Checking {r.code} ({dep_s}..{ret_s})...", flush=True)
+                            res = await check_route_secondary_site(ctx, site_name, r, dep_s, ret_s)
+                    else:
+                        if idx > 0:
+                            await asyncio.sleep(random.uniform(1.0, 1.8))
+                        print(f"[{site_name}] Checking {r.code} ({dep_s}..{ret_s})...", flush=True)
+                        res = await check_route_secondary_site(ctx, site_name, r, dep_s, ret_s)
+
                     if isinstance(res, FlightObservation):
                         consecutive_blocks = 0
                         observations.append(res)
@@ -245,7 +260,14 @@ async def execute_run(
                                 checkpoint_file, today, {"kind": "failure", "payload": res.model_dump()}
                             )
                         print(f"  -> FAIL [{site_name}] {r.code}: {res.reason_ja}", flush=True)
-                        if res.category in ("bot_block", "http_error", "timeout", "login_required", "unsupported_route"):
+                        if res.category in (
+                            "bot_block",
+                            "http_error",
+                            "timeout",
+                            "login_required",
+                            "unsupported_route",
+                            "parse_error",
+                        ):
                             consecutive_blocks += 1
                             block_reason_memo = res.reason_ja
                         else:
