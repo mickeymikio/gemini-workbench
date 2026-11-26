@@ -14,6 +14,7 @@ from tasks.flight_deals.dashboard import build_dashboard_html, load_snapshots
 from tasks.flight_deals.models import JST, FetchFailure, FlightObservation, format_date_ja
 from tasks.flight_deals.reporter import render_report
 from tasks.flight_deals.run import append_checkpoint, load_intrarun_checkpoint
+from tasks.flight_deals.serve_dashboard import _clean_path_arg, discover_dashboard_dir, make_dashboard_handler
 from tasks.flight_deals.sites.base import detect_access_barrier
 from tasks.flight_deals.sites.google_flights import (
     parse_checked_baggage_ja,
@@ -394,6 +395,32 @@ class TestCheckpointAndReporter(unittest.TestCase):
             self.assertNotIn(":root", art_html)
             st_html = build_dashboard_html(loaded, mode="standalone")
             self.assertIn(":root", st_html)
+
+            # Verify serve_dashboard handles quoted Windows-style args & serves HTTP 200 on / and /healthz
+            from http.server import ThreadingHTTPServer
+            import threading
+            import urllib.request
+
+            cleaned = _clean_path_arg(f'"{td}\\"')
+            self.assertEqual(cleaned, Path(td).resolve())
+            self.assertEqual(discover_dashboard_dir(f'"{td}"'), Path(td).resolve())
+
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), make_dashboard_handler(td))
+            port = srv.server_address[1]
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as r_h:
+                    self.assertEqual(r_h.status, 200)
+                    h_data = json.loads(r_h.read().decode("utf-8"))
+                    self.assertEqual(h_data["snapshot_count"], 1)
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r_root:
+                    self.assertEqual(r_root.status, 200)
+                    body = r_root.read().decode("utf-8")
+                    self.assertIn("国際線15路線", body)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
 
 if __name__ == "__main__":

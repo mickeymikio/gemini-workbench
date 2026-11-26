@@ -1,7 +1,7 @@
 # Standalone runner & installer for Windows 10/11 Pro (e.g. NAS Windows VM)
 # Runs 100% locally with Python + Playwright (zero Gemini Web access).
 #
-# Full one-shot setup (venv + daily 13:00 Task Scheduler + background LAN/Tailscale server on :8787):
+# Full one-shot setup:
 #   powershell -ExecutionPolicy Bypass -File .\tasks\flight_deals\windows_runner.ps1 -InstallAll
 
 param(
@@ -50,8 +50,6 @@ function Ensure-Venv {
 function Ensure-FirewallRule {
     $RuleName = "FlightDealsDashboard_LAN_$DashboardPort"
     try {
-        # Remove older Private-only rule if present; NAS virtual NICs & Tailscale adapters often default
-        # to Windows 'Public' (Unidentified network) profile, so scope safely via RemoteAddress instead!
         Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
         New-NetFirewallRule -DisplayName $RuleName `
             -Direction Inbound `
@@ -68,10 +66,25 @@ function Ensure-FirewallRule {
     }
 }
 
+function Stop-DashboardServer {
+    Stop-ScheduledTask -TaskName "FlightDealsDashboardServer" -ErrorAction SilentlyContinue
+    $Pids = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+    foreach ($p in $Pids) {
+        if ($p -and $p -gt 4) {
+            Write-Host "[windows_runner] Stopping stale listener PID $p on port $DashboardPort..."
+            Stop-Process -Id $p -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Start-Sleep -Seconds 1
+}
+
 function Register-DashboardServerTask {
     $RunnerPy = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
     $ServeScript = Join-Path $RepoDir "tasks\flight_deals\serve_dashboard.py"
-    $SrvAction = New-ScheduledTaskAction -Execute $RunnerPy -Argument "`"$ServeScript`" --dir `"$DashDir`" --port $DashboardPort"
+    # Omit --dir so serve_dashboard.py auto-discovers the active dashboard directory in pure Python
+    # without any Windows command-line quote escaping issues!
+    $SrvAction = New-ScheduledTaskAction -Execute $RunnerPy -Argument "`"$ServeScript`" --port $DashboardPort"
     $SrvTrigger = New-ScheduledTaskTrigger -AtLogOn
     $SrvSettings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -81,10 +94,12 @@ function Register-DashboardServerTask {
     Register-ScheduledTask -TaskName "FlightDealsDashboardServer" -Action $SrvAction -Trigger $SrvTrigger -Settings $SrvSettings -Force | Out-Null
 }
 
-function Ensure-DashboardServer {
+function Ensure-DashboardServer([switch]$ForceRestart) {
+    if ($ForceRestart) {
+        Stop-DashboardServer
+    }
     $Listening = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue
     if (-not $Listening) {
-        # Start via Task Scheduler first so the server survives outside ephemeral agent/SSH shells!
         if (Get-ScheduledTask -TaskName "FlightDealsDashboardServer" -ErrorAction SilentlyContinue) {
             Start-ScheduledTask -TaskName "FlightDealsDashboardServer" -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 2
@@ -93,15 +108,16 @@ function Ensure-DashboardServer {
         if (-not $Listening) {
             $RunnerPy = if (Test-Path $PythonwExe) { $PythonwExe } else { $PythonExe }
             $ServeScript = Join-Path $RepoDir "tasks\flight_deals\serve_dashboard.py"
-            Start-Process -FilePath $RunnerPy -ArgumentList "`"$ServeScript`" --dir `"$DashDir`" --port $DashboardPort" -WindowStyle Hidden
+            Start-Process -FilePath $RunnerPy -ArgumentList @($ServeScript, "--port", "$DashboardPort") -WindowStyle Hidden
             Start-Sleep -Seconds 2
         }
     }
-    $FinalCheck = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue
-    if ($FinalCheck) {
-        Write-Host "[windows_runner] Dashboard HTTP server is LISTENING on 0.0.0.0:$DashboardPort"
-    } else {
-        Write-Warning "[windows_runner] Dashboard HTTP server failed to bind port $DashboardPort"
+
+    try {
+        $Health = Invoke-RestMethod -Uri "http://127.0.0.1:${DashboardPort}/healthz" -TimeoutSec 5
+        Write-Host "[windows_runner] Server health OK (HTTP 200): dir=$($Health.dashboard_dir), snapshots=$($Health.snapshot_count)"
+    } catch {
+        Write-Warning "[windows_runner] Server health check failed on port ${DashboardPort}: $_"
     }
 }
 
@@ -111,9 +127,9 @@ function Print-AccessUrls {
         Select-Object -ExpandProperty IPAddress
     foreach ($ip in $AllIps) {
         if ($ip -like "100.*") {
-            Write-Host "  -> Tailscale URL (works across NAT): http://${ip}:${DashboardPort}/"
+            Write-Host "  -> Tailscale URL (recommended): http://${ip}:${DashboardPort}/"
         } else {
-            Write-Host "  -> Adapter IP URL                 : http://${ip}:${DashboardPort}/"
+            Write-Host "  -> Adapter IP URL             : http://${ip}:${DashboardPort}/"
         }
     }
 }
@@ -122,7 +138,7 @@ if ($RestartServerOnly) {
     Ensure-Venv
     Register-DashboardServerTask
     Ensure-FirewallRule
-    Ensure-DashboardServer
+    Ensure-DashboardServer -ForceRestart
     Print-AccessUrls
     exit 0
 }
@@ -143,7 +159,7 @@ if ($InstallAll -or $RegisterSchedule) {
 
     Register-DashboardServerTask
     Ensure-FirewallRule
-    Ensure-DashboardServer
+    Ensure-DashboardServer -ForceRestart
     Write-Host "[windows_runner] Registered 'DailyFlightDeals15Routes' (Daily at $DailyTime) & 'FlightDealsDashboardServer'."
     Print-AccessUrls
 
