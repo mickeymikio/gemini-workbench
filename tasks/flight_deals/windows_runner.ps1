@@ -1,4 +1,4 @@
-# Standalone runner & installer for Windows 10/11 Pro (e.g. NAS Windows VM)
+﻿# Standalone runner & installer for Windows 10/11 Pro (e.g. NAS Windows VM)
 # Runs 100% locally with Python + Playwright (zero Gemini Web access).
 #
 # Full one-shot setup:
@@ -72,11 +72,17 @@ function Stop-DashboardServer {
         Select-Object -ExpandProperty OwningProcess -Unique
     foreach ($p in $Pids) {
         if ($p -and $p -gt 4) {
-            Write-Host "[windows_runner] Stopping stale listener PID $p on port $DashboardPort..."
+            Write-Host "[windows_runner] Killing process tree PID $p on port $DashboardPort..."
+            & taskkill.exe /F /T /PID $p 2>&1 | Out-Null
             Stop-Process -Id $p -Force -ErrorAction SilentlyContinue
         }
     }
-    Start-Sleep -Seconds 1
+    Start-Sleep -Seconds 2
+    $StillListening = Get-NetTCPConnection -LocalPort $DashboardPort -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique
+    if ($StillListening) {
+        throw "Port $DashboardPort is STILL held by PID $($StillListening -join ','). Please run PowerShell as Administrator ('管理者として実行') to stop the elevated process."
+    }
 }
 
 function Register-DashboardServerTask {
